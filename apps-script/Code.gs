@@ -9,7 +9,7 @@ const CONFIG = {
   WFO: 'LIX',
   PIL_PREFIX: 'TAF',
   SITES: ['KMSY', 'KBTR', 'KNEW', 'KHDC', 'KHUM', 'KGPT', 'KASD', 'KMCB'],
-  IEM_AFOS_LIST_URL: 'https://mesonet.agron.iastate.edu/wx/afos/list.phtml',
+  IEM_AFOS_PRODUCT_URL: 'https://mesonet.agron.iastate.edu/wx/afos/p.php',
   IEM_ASOS_URL: 'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py',
 };
 
@@ -23,11 +23,7 @@ function doGet() {
 }
 
 function getConfig() {
-  return {
-    wfo: CONFIG.WFO,
-    pilPrefix: CONFIG.PIL_PREFIX,
-    sites: CONFIG.SITES,
-  };
+  return { wfo: CONFIG.WFO, pilPrefix: CONFIG.PIL_PREFIX, sites: CONFIG.SITES };
 }
 
 function runVerification(request) {
@@ -49,9 +45,13 @@ function runVerification(request) {
 
   const tafProducts = [];
   const tafErrors = [];
+  let preferredIssued = null;
+
   sites.forEach(site => {
     try {
-      tafProducts.push(fetchTafProductForSite(site, CONFIG.WFO, start));
+      const product = fetchTafProductForSite(site, start, preferredIssued);
+      tafProducts.push(product);
+      if (!preferredIssued && product.issued) preferredIssued = new Date(product.issued);
     } catch (err) {
       tafErrors.push({ site, error: err.message || String(err) });
     }
@@ -82,22 +82,10 @@ function runVerification(request) {
 
   const matched = attachForecastToObs(metars, tafPeriods, Boolean(request.includeTempo));
   const overall = contingency(matched, threshold);
-  const byStation = sites.map(station => {
-    const stationRows = matched.filter(r => r.station === station);
-    return Object.assign({ station }, contingency(stationRows, threshold));
-  });
+  const byStation = sites.map(station => Object.assign({ station }, contingency(matched.filter(r => r.station === station), threshold)));
 
   return {
-    request: {
-      date: dateText,
-      cycle,
-      threshold,
-      windowHours,
-      sites,
-      start: iso(start),
-      end: iso(end),
-      includeTempo: Boolean(request.includeTempo),
-    },
+    request: { date: dateText, cycle, threshold, windowHours, sites, start: iso(start), end: iso(end), includeTempo: Boolean(request.includeTempo) },
     tafProducts,
     tafErrors,
     tafBlocks,
@@ -109,50 +97,46 @@ function runVerification(request) {
   };
 }
 
-function fetchTafProductForSite(site, wfo, start) {
+function fetchTafProductForSite(site, tafCycleStart, preferredIssued) {
   const pil = CONFIG.PIL_PREFIX + site.replace(/^K/, '');
-  const nextDay = new Date(start.getTime() + 24 * 60 * 60 * 1000);
-  const params = {
-    source: wfo,
-    pil: pil,
-    year1: start.getUTCFullYear(),
-    month1: start.getUTCMonth() + 1,
-    day1: start.getUTCDate(),
-    year2: nextDay.getUTCFullYear(),
-    month2: nextDay.getUTCMonth() + 1,
-    day2: nextDay.getUTCDate(),
-    sort: 'asc',
-  };
-  const listUrl = CONFIG.IEM_AFOS_LIST_URL + '?' + toQuery(params);
-  const html = fetchText(listUrl);
-  const links = [];
-  const safePil = pil.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const linkRegex = new RegExp('<a[^>]+href="([^"]*p\\.php[^"]*pil=' + safePil + '[^"]*)"[^>]*>\\s*' + safePil + '\\s*</a>', 'gi');
-  let match;
-  while ((match = linkRegex.exec(html)) !== null) {
-    const href = htmlDecode(match[1]).replace(/&amp;/g, '&');
-    const issued = issuedFromUrl(href);
-    if (issued) links.push({ href, issued });
+
+  if (preferredIssued) {
+    const direct = tryFetchTafProductAt(site, pil, preferredIssued);
+    if (direct) return direct;
   }
 
-  if (!links.length) {
-    throw new Error('No ' + pil + ' products found from IEM listing. URL tried: ' + listUrl);
+  // Operational TAFs are commonly issued before the valid cycle, often near HH-40.
+  // Instead of relying on IEM's listing page parameters, scan p.php directly by
+  // exact issuance minute around the selected cycle. This is slower but much more
+  // reliable in Apps Script.
+  const target = new Date(tafCycleStart.getTime() - 40 * 60 * 1000);
+  const candidates = [];
+  for (let offset = -60; offset <= 60; offset++) {
+    candidates.push(new Date(target.getTime() + offset * 60 * 1000));
+  }
+  candidates.sort((a, b) => Math.abs(a - target) - Math.abs(b - target));
+
+  for (let i = 0; i < candidates.length; i++) {
+    const product = tryFetchTafProductAt(site, pil, candidates[i]);
+    if (product) return product;
   }
 
-  links.sort((a, b) => Math.abs(a.issued.getTime() - start.getTime()) - Math.abs(b.issued.getTime() - start.getTime()));
-  const chosen = links[0];
-  const productUrl = absolutizeIemUrl(chosen.href);
-  const productHtml = fetchText(productUrl);
-  const text = extractPreText(productHtml);
+  throw new Error('No ' + pil + ' product found by scanning IEM p.php from ' + iso(candidates[0]) + ' through ' + iso(candidates[candidates.length - 1]));
+}
 
-  return {
-    site,
-    pil,
-    issued: iso(chosen.issued),
-    sourceUrl: productUrl,
-    listingUrl: listUrl,
-    text,
-  };
+function tryFetchTafProductAt(site, pil, issued) {
+  const url = CONFIG.IEM_AFOS_PRODUCT_URL + '?' + toQuery({ pil: pil, e: iemTimestamp(issued) });
+  let html;
+  try {
+    html = fetchText(url);
+  } catch (err) {
+    return null;
+  }
+  const text = extractPreText(html);
+  if (!text || /No Text Product Found|No product|Invalid/i.test(text)) return null;
+  if (text.indexOf(site) === -1) return null;
+  if (text.indexOf('TAF') === -1 && text.indexOf(pil) === -1) return null;
+  return { site, pil, issued: iso(issued), sourceUrl: url, text };
 }
 
 function fetchMetars(sites, start, end) {
@@ -362,11 +346,9 @@ function fetchText(url) {
   return text;
 }
 
-function issuedFromUrl(url) {
-  const m = String(url).match(/[?&]e=(\d{12})/);
-  if (!m) return null;
-  const s = m[1];
-  return new Date(Date.UTC(Number(s.slice(0, 4)), Number(s.slice(4, 6)) - 1, Number(s.slice(6, 8)), Number(s.slice(8, 10)), Number(s.slice(10, 12)), 0));
+function iemTimestamp(d) {
+  d = new Date(d);
+  return d.getUTCFullYear() + pad2(d.getUTCMonth() + 1) + pad2(d.getUTCDate()) + pad2(d.getUTCHours()) + pad2(d.getUTCMinutes());
 }
 
 function extractPreText(html) {
@@ -383,12 +365,6 @@ function htmlDecode(s) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&#x2F;/g, '/');
-}
-
-function absolutizeIemUrl(href) {
-  if (/^https?:\/\//i.test(href)) return href;
-  if (href.startsWith('/')) return 'https://mesonet.agron.iastate.edu' + href;
-  return 'https://mesonet.agron.iastate.edu/wx/afos/' + href;
 }
 
 function rowToObject(header, row) { const obj = {}; header.forEach((name, i) => obj[name] = row[i]); return obj; }
@@ -415,5 +391,6 @@ function parseSm(value) {
 
 function toQuery(params) { return Object.keys(params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&'); }
 function iso(d) { return new Date(d).toISOString(); }
+function pad2(n) { return String(n).padStart(2, '0'); }
 function maxDate(a, b) { return a > b ? a : b; }
 function minDate(a, b) { return a < b ? a : b; }
