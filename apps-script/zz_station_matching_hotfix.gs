@@ -2,8 +2,11 @@
 //
 // IEM ASOS/METAR CSV often returns stations as 3-letter IDs like BTR, while
 // TAF products use 4-letter IDs like KBTR. The verification matcher needs both
-// sides to use the same ID format. Add this as a separate Apps Script file after
-// Code.gs, or copy these edits into Code.gs.
+// sides to use the same ID format.
+//
+// This version also limits observations to routine METARs + specials. The earlier
+// request was accidentally pulling 5-minute HFMETAR rows, which inflated correct
+// negatives like crazy.
 
 function normalizeStation(station) {
   station = String(station || '').trim().toUpperCase();
@@ -20,7 +23,8 @@ function fetchMetars(sites, start, end) {
     ['year1', start.getUTCFullYear()], ['month1', start.getUTCMonth() + 1], ['day1', start.getUTCDate()], ['hour1', start.getUTCHours()], ['minute1', start.getUTCMinutes()],
     ['year2', end.getUTCFullYear()], ['month2', end.getUTCMonth() + 1], ['day2', end.getUTCDate()], ['hour2', end.getUTCHours()], ['minute2', end.getUTCMinutes()],
     ['tz', 'Etc/UTC'], ['format', 'comma'], ['latlon', 'no'], ['elev', 'no'], ['missing', 'M'], ['trace', 'T'], ['direct', 'no'],
-    ['report_type', '1'], ['report_type', '2']
+    // IEM report_type values: 2 = routine/hourly METAR, 3 = specials.
+    ['report_type', '2'], ['report_type', '3']
   );
 
   const url = CONFIG.IEM_ASOS_URL + '?' + pairs.map(p => encodeURIComponent(p[0]) + '=' + encodeURIComponent(p[1])).join('&');
