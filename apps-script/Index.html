@@ -1,0 +1,138 @@
+<!doctype html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: Arial, sans-serif; margin: 18px; color: #1f2933; }
+      h1 { margin-bottom: 4px; }
+      .subtle { color: #64748b; margin-top: 0; }
+      .panel { border: 1px solid #d0d7de; border-radius: 10px; padding: 14px; margin: 14px 0; background: #fff; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; align-items: end; }
+      label { font-weight: 700; display: block; margin-bottom: 4px; }
+      input, select, button { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 7px; border: 1px solid #cbd5e1; font-size: 14px; }
+      button { background: #2563eb; color: white; border: 0; font-weight: 700; cursor: pointer; }
+      button:disabled { background: #94a3b8; cursor: wait; }
+      .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+      .metric { border: 1px solid #d0d7de; border-radius: 10px; padding: 12px; background: #f8fafc; }
+      .metric .label { color: #64748b; font-size: 12px; font-weight: 700; }
+      .metric .value { font-size: 24px; font-weight: 800; margin-top: 4px; }
+      table { border-collapse: collapse; width: 100%; font-size: 13px; }
+      th, td { border: 1px solid #d0d7de; padding: 6px; vertical-align: top; }
+      th { background: #f1f5f9; text-align: left; }
+      pre { white-space: pre-wrap; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; }
+      .error { color: #991b1b; background: #fee2e2; border: 1px solid #fecaca; padding: 10px; border-radius: 8px; }
+      .ok { color: #14532d; background: #dcfce7; border: 1px solid #bbf7d0; padding: 10px; border-radius: 8px; }
+      .checkbox-row { display: flex; gap: 8px; align-items: center; margin-top: 26px; }
+      .checkbox-row input { width: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>TAF Verification</h1>
+    <p class="subtle">Google Apps Script web app using IEM archived TAF and METAR data.</p>
+
+    <div class="panel">
+      <div class="grid">
+        <div><label for="date">UTC date</label><input id="date" type="date"></div>
+        <div><label for="cycle">TAF cycle</label><select id="cycle"><option value="0">00z</option><option value="6">06z</option><option value="12" selected>12z</option><option value="18">18z</option></select></div>
+        <div><label for="site">Terminal</label><select id="site"></select></div>
+        <div><label for="threshold">Verify category</label><select id="threshold"><option value="LIFR">LIFR-or-worse</option><option value="IFR" selected>IFR-or-worse</option><option value="MVFR">MVFR-or-worse</option></select></div>
+        <div><label for="windowHours">Window hours</label><input id="windowHours" type="number" min="1" max="30" value="6"></div>
+        <div class="checkbox-row"><input id="includeTempo" type="checkbox"><label for="includeTempo" style="margin: 0; font-weight: 600;">Include TEMPO/PROB/BECMG</label></div>
+        <div><button id="runBtn">Run verification</button></div>
+      </div>
+    </div>
+
+    <div id="status"></div>
+    <div id="output"></div>
+
+    <script>
+      const today = new Date();
+      today.setUTCDate(today.getUTCDate() - 1);
+      document.getElementById('date').value = today.toISOString().slice(0, 10);
+      document.getElementById('runBtn').addEventListener('click', runVerification);
+
+      google.script.run.withSuccessHandler(initConfig).withFailureHandler(showError).getConfig();
+
+      function initConfig(config) {
+        const siteSelect = document.getElementById('site');
+        siteSelect.innerHTML = '<option value="All">All</option>' + config.sites.map(s => `<option value="${s}">${s}</option>`).join('');
+      }
+
+      function runVerification() {
+        setBusy(true);
+        document.getElementById('output').innerHTML = '';
+        document.getElementById('status').innerHTML = '<div class="ok">Fetching IEM data and verifying... this may take a few seconds.</div>';
+        const payload = {
+          date: document.getElementById('date').value,
+          cycle: Number(document.getElementById('cycle').value),
+          site: document.getElementById('site').value,
+          threshold: document.getElementById('threshold').value,
+          windowHours: Number(document.getElementById('windowHours').value),
+          includeTempo: document.getElementById('includeTempo').checked,
+        };
+        google.script.run.withSuccessHandler(render).withFailureHandler(showError).runVerification(payload);
+      }
+
+      function render(data) {
+        setBusy(false);
+        document.getElementById('status').innerHTML = '';
+        const req = data.request;
+        const tafUrl = data.tafProduct.sourceUrl || '#';
+        const html = [];
+        html.push(`<div class="panel"><h2>Summary</h2>`);
+        html.push(`<p><b>Window:</b> ${fmt(req.start)} to ${fmt(req.end)} UTC<br><b>Sites:</b> ${req.sites.join(', ')}<br><b>Threshold:</b> ${req.threshold}-or-worse</p>`);
+        html.push(metricCards(data.overall));
+        html.push(`</div>`);
+        html.push(`<div class="panel"><h2>By station</h2>${table(data.byStation, ['station', 'hits', 'misses', 'false_alarms', 'correct_negatives', 'POD', 'FAR', 'CSI'])}</div>`);
+        html.push(`<div class="panel"><h2>TAF product</h2><p><b>PIL:</b> ${escapeHtml(data.tafProduct.pil)} | <b>Issued:</b> ${fmt(data.tafProduct.issued)} UTC | <a href="${tafUrl}" target="_blank">Open IEM product</a></p><pre>${escapeHtml(data.tafProduct.text)}</pre></div>`);
+        html.push(`<div class="panel"><h2>Parsed TAF periods</h2>${table(data.tafPeriods, ['station', 'group_type', 'start', 'end', 'forecast_visibility_sm', 'forecast_ceiling_ft', 'forecast_category', 'is_prevailing', 'group_text'])}</div>`);
+        html.push(`<div class="panel"><h2>METAR observations</h2>${table(data.metars, ['station', 'valid', 'vsby', 'ceiling_ft', 'obs_category', 'wxcodes', 'metar'])}</div>`);
+        html.push(`<div class="panel"><h2>Matched forecast vs observed</h2>${table(data.matched, ['station', 'valid', 'forecast_category', 'obs_category', 'vsby', 'ceiling_ft', 'forecast_group', 'metar'])}</div>`);
+        document.getElementById('output').innerHTML = html.join('');
+      }
+
+      function metricCards(stats) {
+        const items = [['Hits', stats.hits], ['Misses', stats.misses], ['False Alarms', stats.false_alarms], ['Correct Negatives', stats.correct_negatives], ['POD', fmtNum(stats.POD)], ['FAR', fmtNum(stats.FAR)], ['CSI', fmtNum(stats.CSI)]];
+        return `<div class="metrics">${items.map(([label, value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`).join('')}</div>`;
+      }
+
+      function table(rows, cols) {
+        if (!rows || !rows.length) return '<p class="subtle">No rows returned.</p>';
+        const head = `<tr>${cols.map(c => `<th>${escapeHtml(c)}</th>`).join('')}</tr>`;
+        const body = rows.map(row => `<tr>${cols.map(c => `<td>${escapeHtml(formatCell(row[c]))}</td>`).join('')}</tr>`).join('');
+        return `<table>${head}${body}</table>`;
+      }
+
+      function formatCell(value) {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(2);
+        if (typeof value === 'boolean') return value ? 'yes' : 'no';
+        return String(value);
+      }
+
+      function fmt(value) {
+        if (!value) return '';
+        try { return new Date(value).toISOString().slice(0, 16).replace('T', ' '); }
+        catch (e) { return String(value); }
+      }
+
+      function fmtNum(value) { return value === null || value === undefined || Number.isNaN(value) ? 'NA' : Number(value).toFixed(2); }
+
+      function showError(err) {
+        setBusy(false);
+        const msg = err && err.message ? err.message : String(err);
+        document.getElementById('status').innerHTML = `<div class="error"><b>Error:</b> ${escapeHtml(msg)}</div>`;
+      }
+
+      function setBusy(isBusy) {
+        const btn = document.getElementById('runBtn');
+        btn.disabled = isBusy;
+        btn.textContent = isBusy ? 'Running...' : 'Run verification';
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      }
+    </script>
+  </body>
+</html>
