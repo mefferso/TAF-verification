@@ -1,0 +1,22 @@
+Reason POD/FAR/CSI can show NA: IEM METAR CSV often returns 3-letter station IDs such as BTR, while the TAF/product code uses 4-letter IDs such as KBTR. The forecast matching step needs both sides normalized to the same format.
+
+Manual hotfix in Code.gs:
+
+1) In fetchMetars(), immediately after:
+const rec = rowToObject(header, row);
+
+add:
+rec.station = normalizeStation(rec.station);
+
+2) Add this helper near the bottom of Code.gs:
+
+function normalizeStation(station) {
+  station = String(station || '').trim().toUpperCase();
+  if (/^[A-Z]{3}$/.test(station)) return 'K' + station;
+  return station;
+}
+
+3) Optional but good: in parseTafBlock(), change station assignment to:
+const station = stationMatch ? normalizeStation(stationMatch[1]) : 'UNKNOWN';
+
+Then save and redeploy a new version of the Apps Script web app.
