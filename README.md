@@ -20,7 +20,7 @@ apps-script/
 ## What it does now
 
 - User selects UTC date, TAF cycle, terminal, category threshold, and verification window.
-- Fetches archived `TAFLIX` product from IEM.
+- Fetches archived station-specific TAF products from IEM, such as `TAFMSY`, `TAFBTR`, etc.
 - Fetches METAR observations from IEM.
 - Classifies observed flight category from ceiling/visibility.
 - Parses basic TAF prevailing/FM groups.
