@@ -1,15 +1,13 @@
 /**
  * TAF Verification Web App - Google Apps Script backend.
  *
- * This keeps the project inside the Google/GitHub world:
- * - GitHub stores source code.
- * - Google Apps Script runs the dashboard and fetches IEM data server-side.
- * - Coworkers use a normal Web App URL. No PowerShell, no local Python.
+ * GitHub stores source code. Google Apps Script runs the web app and fetches
+ * IEM data server-side. Coworkers use a normal Web App URL.
  */
 
 const CONFIG = {
   WFO: 'LIX',
-  PIL: 'TAFLIX',
+  PIL_PREFIX: 'TAF',
   SITES: ['KMSY', 'KBTR', 'KNEW', 'KHDC', 'KHUM', 'KGPT', 'KASD', 'KMCB'],
   IEM_AFOS_LIST_URL: 'https://mesonet.agron.iastate.edu/wx/afos/list.phtml',
   IEM_ASOS_URL: 'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py',
@@ -27,7 +25,7 @@ function doGet() {
 function getConfig() {
   return {
     wfo: CONFIG.WFO,
-    pil: CONFIG.PIL,
+    pilPrefix: CONFIG.PIL_PREFIX,
     sites: CONFIG.SITES,
   };
 }
@@ -49,13 +47,33 @@ function runVerification(request) {
   ));
   const end = new Date(start.getTime() + windowHours * 60 * 60 * 1000);
 
-  const tafProduct = fetchTafProduct(CONFIG.PIL, CONFIG.WFO, start, cycle);
-  const tafBlocks = splitTafBySite(tafProduct.text, sites);
+  const tafProducts = [];
+  const tafErrors = [];
+  sites.forEach(site => {
+    try {
+      tafProducts.push(fetchTafProductForSite(site, CONFIG.WFO, start));
+    } catch (err) {
+      tafErrors.push({ site, error: err.message || String(err) });
+    }
+  });
+
+  if (!tafProducts.length) {
+    throw new Error('No station TAF products found. First error: ' + (tafErrors[0] ? tafErrors[0].error : 'unknown'));
+  }
+
+  const tafBlocks = {};
+  tafProducts.forEach(product => {
+    const blocks = splitTafBySite(product.text, [product.site]);
+    tafBlocks[product.site] = blocks[product.site] || product.text;
+  });
+
   const metars = fetchMetars(sites, start, end);
 
   let tafPeriods = [];
   Object.keys(tafBlocks).forEach(site => {
-    const periods = parseTafBlock(tafBlocks[site], tafProduct.issued || start, start, end);
+    const product = tafProducts.find(p => p.site === site);
+    const issueTime = product && product.issued ? new Date(product.issued) : start;
+    const periods = parseTafBlock(tafBlocks[site], issueTime, start, end);
     periods.forEach(p => {
       p.station = site;
       tafPeriods.push(p);
@@ -64,8 +82,8 @@ function runVerification(request) {
 
   const matched = attachForecastToObs(metars, tafPeriods, Boolean(request.includeTempo));
   const overall = contingency(matched, threshold);
-  const byStation = sites.map(site => {
-    const stationRows = matched.filter(r => r.station === site);
+  const byStation = sites.map(station => {
+    const stationRows = matched.filter(r => r.station === station);
     return Object.assign({ station }, contingency(stationRows, threshold));
   });
 
@@ -80,7 +98,8 @@ function runVerification(request) {
       end: iso(end),
       includeTempo: Boolean(request.includeTempo),
     },
-    tafProduct,
+    tafProducts,
+    tafErrors,
     tafBlocks,
     tafPeriods,
     metars,
@@ -90,7 +109,8 @@ function runVerification(request) {
   };
 }
 
-function fetchTafProduct(pil, wfo, start, cycle) {
+function fetchTafProductForSite(site, wfo, start) {
+  const pil = CONFIG.PIL_PREFIX + site.replace(/^K/, '');
   const nextDay = new Date(start.getTime() + 24 * 60 * 60 * 1000);
   const params = {
     source: wfo,
@@ -106,15 +126,13 @@ function fetchTafProduct(pil, wfo, start, cycle) {
   const listUrl = CONFIG.IEM_AFOS_LIST_URL + '?' + toQuery(params);
   const html = fetchText(listUrl);
   const links = [];
-
-  const linkRegex = new RegExp('<a[^>]+href="([^"]*p\\.php[^"]*pil=' + pil + '[^"]*)"[^>]*>\\s*' + pil + '\\s*</a>', 'gi');
+  const safePil = pil.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const linkRegex = new RegExp('<a[^>]+href="([^"]*p\\.php[^"]*pil=' + safePil + '[^"]*)"[^>]*>\\s*' + safePil + '\\s*</a>', 'gi');
   let match;
   while ((match = linkRegex.exec(html)) !== null) {
     const href = htmlDecode(match[1]).replace(/&amp;/g, '&');
     const issued = issuedFromUrl(href);
-    if (issued) {
-      links.push({ href, issued });
-    }
+    if (issued) links.push({ href, issued });
   }
 
   if (!links.length) {
@@ -128,6 +146,7 @@ function fetchTafProduct(pil, wfo, start, cycle) {
   const text = extractPreText(productHtml);
 
   return {
+    site,
     pil,
     issued: iso(chosen.issued),
     sourceUrl: productUrl,
@@ -182,11 +201,8 @@ function splitTafBySite(productText, sites) {
       blocks[current] = [line];
     } else if (current) {
       const other = line.match(siteRe);
-      if (other && !wanted.has(other[2])) {
-        current = null;
-      } else {
-        blocks[current].push(line);
-      }
+      if (other && !wanted.has(other[2])) current = null;
+      else blocks[current].push(line);
     }
   });
 
@@ -224,9 +240,7 @@ function parseTafBlock(tafText, issueTime, windowStart, windowEnd) {
   });
 
   const prevailing = periods.filter(p => p.is_prevailing).sort((a, b) => new Date(a.start) - new Date(b.start));
-  for (let i = 0; i < prevailing.length - 1; i++) {
-    prevailing[i].end = prevailing[i + 1].start;
-  }
+  for (let i = 0; i < prevailing.length - 1; i++) prevailing[i].end = prevailing[i + 1].start;
 
   periods = periods
     .filter(p => new Date(p.end) > windowStart && new Date(p.start) < windowEnd)
@@ -243,9 +257,7 @@ function attachForecastToObs(obs, tafPeriods, includeTempo) {
     const valid = new Date(ob.valid);
     let periods = tafPeriods.filter(p => p.station === ob.station);
     if (!includeTempo) periods = periods.filter(p => p.is_prevailing);
-    const matches = periods
-      .filter(p => new Date(p.start) <= valid && new Date(p.end) > valid)
-      .sort((a, b) => new Date(a.start) - new Date(b.start));
+    const matches = periods.filter(p => new Date(p.start) <= valid && new Date(p.end) > valid).sort((a, b) => new Date(a.start) - new Date(b.start));
     const chosen = matches.length ? matches[matches.length - 1] : null;
     return Object.assign({}, ob, {
       forecast_category: chosen ? chosen.forecast_category : '',
@@ -297,9 +309,7 @@ function forecastCeiling(text) {
   const ceilings = [];
   const re = /\b(FEW|SCT|BKN|OVC|VV)(\d{3})\b/g;
   let m;
-  while ((m = re.exec(text)) !== null) {
-    if (CEILING_COVERS.indexOf(m[1]) >= 0) ceilings.push(Number(m[2]) * 100);
-  }
+  while ((m = re.exec(text)) !== null) if (CEILING_COVERS.indexOf(m[1]) >= 0) ceilings.push(Number(m[2]) * 100);
   return ceilings.length ? Math.min.apply(null, ceilings) : null;
 }
 
@@ -342,9 +352,7 @@ function resolveTafTime(reference, day, hour, minute) {
   return candidates[0];
 }
 
-function eventBool(category, threshold) {
-  return CATEGORY_RANK[category] <= CATEGORY_RANK[threshold];
-}
+function eventBool(category, threshold) { return CATEGORY_RANK[category] <= CATEGORY_RANK[threshold]; }
 
 function fetchText(url) {
   const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
@@ -383,11 +391,7 @@ function absolutizeIemUrl(href) {
   return 'https://mesonet.agron.iastate.edu/wx/afos/' + href;
 }
 
-function rowToObject(header, row) {
-  const obj = {};
-  header.forEach((name, i) => obj[name] = row[i]);
-  return obj;
-}
+function rowToObject(header, row) { const obj = {}; header.forEach((name, i) => obj[name] = row[i]); return obj; }
 
 function numberOrNull(value) {
   if (value === null || value === undefined || value === '' || value === 'M' || value === 'null') return null;
@@ -409,18 +413,7 @@ function parseSm(value) {
   return Number(value);
 }
 
-function toQuery(params) {
-  return Object.keys(params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
-}
-
-function iso(d) {
-  return new Date(d).toISOString();
-}
-
-function maxDate(a, b) {
-  return a > b ? a : b;
-}
-
-function minDate(a, b) {
-  return a < b ? a : b;
-}
+function toQuery(params) { return Object.keys(params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&'); }
+function iso(d) { return new Date(d).toISOString(); }
+function maxDate(a, b) { return a > b ? a : b; }
+function minDate(a, b) { return a < b ? a : b; }
